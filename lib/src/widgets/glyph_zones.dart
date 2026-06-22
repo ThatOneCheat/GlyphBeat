@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
 /// On-screen mirror of the rear glyph drum zones. Lights one zone at a time:
-/// Kick (1) -> Ring, Snare (2) -> Slash, Hat (3) -> Dot.
-/// Matches the one-zone-at-a-time glyph behaviour, hold durations and linear decay.
+/// Kick (1) -> Slash, Snare (2) -> Dot, Hat (3) -> Ring (matches GlyphController.flashBeat).
+/// The hardware is beat-locked: a classified drum hit flashes one zone, then it goes dark
+/// until the next hit. This mirror shows the same one-zone-at-a-time hop, adding a short
+/// linear decay (~100ms) so the on-screen dot fades instead of strobing.
 class GlyphZones extends StatefulWidget {
   final int activeDrum;
   final int activeDrumAt;
@@ -122,19 +124,19 @@ class _GlyphZonesState extends State<GlyphZones>
         _ZoneVisual(
           label: 'KICK',
           brightness: _activeZone == 1 ? _brightness : 0.0,
-          shape: _ZoneShape.ring,
+          shape: _ZoneShape.slash,
         ),
         const SizedBox(width: 30),
         _ZoneVisual(
           label: 'SNARE',
           brightness: _activeZone == 2 ? _brightness : 0.0,
-          shape: _ZoneShape.slash,
+          shape: _ZoneShape.dot,
         ),
         const SizedBox(width: 30),
         _ZoneVisual(
           label: 'HAT',
           brightness: _activeZone == 3 ? _brightness : 0.0,
-          shape: _ZoneShape.dot,
+          shape: _ZoneShape.ring,
         ),
       ],
     );

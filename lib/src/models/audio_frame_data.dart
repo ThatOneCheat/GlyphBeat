@@ -6,6 +6,7 @@ class AudioFrameData {
   final bool isOnset;
   final double confidence;
   final String beatType;
+  final double mlConfidence;
   final int strongestBandIndex;
   final double spatialPan;
   final String captureSource;
@@ -27,6 +28,7 @@ class AudioFrameData {
     required this.isOnset,
     required this.confidence,
     required this.beatType,
+    required this.mlConfidence,
     required this.strongestBandIndex,
     required this.spatialPan,
     required this.captureSource,
@@ -52,6 +54,7 @@ class AudioFrameData {
       isOnset: map['isOnset'] as bool,
       confidence: (map['confidence'] as num).toDouble(),
       beatType: map['beatType'] as String,
+      mlConfidence: (map['mlConfidence'] as num?)?.toDouble() ?? 0,
       strongestBandIndex: (map['strongestBandIndex'] as num?)?.toInt() ?? -1,
       spatialPan: (map['spatialPan'] as num?)?.toDouble() ?? 0,
       captureSource: map['captureSource'] as String? ?? 'IDLE',

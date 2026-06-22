@@ -1,4 +1,5 @@
 .claude/
+CLAUDE.md
 
 # personal notes, not for the repo
 my-voice.md
@@ -6,6 +7,12 @@ my-voice.md
 # Nothing Glyph SDK — proprietary, not ours to redistribute.
 # Download it yourself from the official Glyph Developer Kit (see README).
 android/app/libs/*.aar
+
+# Real drum-classifier training data + feature caches. The datasets (e.g. IDMT-SMT-Drums,
+# CC BY-NC-ND) are NOT ours to redistribute — only the learned weights ship. Download them
+# yourself with tool/prepare_real_dataset.py.
+tool/_cache/
+*.npz
 
 # Miscellaneous
 *.class

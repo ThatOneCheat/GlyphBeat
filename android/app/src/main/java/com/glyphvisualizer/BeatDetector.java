@@ -62,6 +62,17 @@ public class BeatDetector {
     private long lastOnsetTimeForTempo = 0;
     private double smoothedBpm = 0;
 
+    // Learned kick/snare/hat classifier. When enabled it replaces the band-energy-diff heuristic
+    // for deciding *what* an onset was (the onset *detection* above is unchanged). Allocation-free
+    // per call; see DrumClassifier. Defaults on — it's the whole point of the AI mode.
+    private final DrumClassifier drumClassifier = new DrumClassifier();
+    // Written from the service/binder thread (setUseMlClassifier), read on the DSP thread — volatile.
+    private volatile boolean useMlClassifier = true;
+
+    public void setUseMlClassifier(boolean enabled) {
+        this.useMlClassifier = enabled;
+    }
+
 
 
     public enum BeatType {
@@ -93,6 +104,11 @@ public class BeatDetector {
 
         // Tempo estimate derived from inter-onset intervals (0 until enough beats are seen).
         public double bpm = 0;
+
+        // ML classifier diagnostics: predicted class (0=kick,1=snare,2=hat; -1 if heuristic/none)
+        // and its softmax confidence for the onset that fired this frame.
+        public int mlClass = -1;
+        public double mlConfidence = 0;
     }
 
     public BeatResult detect(
@@ -116,6 +132,8 @@ public class BeatDetector {
         result.adaptiveThreshold = 0;
         result.noiseFloor = 0;
         result.fluxVariance = 0;
+        result.mlClass = -1;
+        result.mlConfidence = 0;
         for (int b = 0; b < NUM_BANDS; b++) {
             result.multiBandOnsets[b] = false;
         }
@@ -347,17 +365,42 @@ public class BeatDetector {
             double scaledTrebleDiff = trebleDiff * 2.5;
 
             if (isOnset) {
-                if (scaledBassDiff > scaledMidDiff && scaledBassDiff > scaledTrebleDiff) {
+                // Decide the drum. ML path (default): the learned classifier reads the spectral
+                // envelope at this onset frame. Heuristic fallback: scaled band-energy diffs.
+                // Both feed the same low-end refinement below so SUB_BASS behaviour is preserved.
+                boolean classifiedKick;
+                if (useMlClassifier) {
+                    int cls = drumClassifier.classify(magnitude, sampleRate);
+                    result.mlClass = cls;
+                    result.mlConfidence = drumClassifier.lastConfidence;
+                    if (cls == DrumClassifier.SNARE) {
+                        result.type = BeatType.SNARE;
+                        classifiedKick = false;
+                    } else if (cls == DrumClassifier.HIHAT) {
+                        result.type = BeatType.HIHAT;
+                        classifiedKick = false;
+                    } else {
+                        classifiedKick = true;
+                    }
+                } else if (scaledBassDiff > scaledMidDiff && scaledBassDiff > scaledTrebleDiff) {
+                    classifiedKick = true;
+                } else if (scaledMidDiff > scaledBassDiff && scaledMidDiff > scaledTrebleDiff) {
+                    result.type = BeatType.SNARE;
+                    classifiedKick = false;
+                } else {
+                    result.type = BeatType.HIHAT;
+                    classifiedKick = false;
+                }
+
+                // Shared low-end refinement: a kick dominated by sub-bass energy and spaced from the
+                // last sub hit is reported as SUB_BASS (it still drives the kick glyph zone).
+                if (classifiedKick) {
                     if (subBassEnergy > bassEnergy * 0.6 && (now - lastSubBeatTime) > minSubBeatInterval) {
                         result.type = BeatType.SUB_BASS;
                         lastSubBeatTime = now;
                     } else {
                         result.type = BeatType.KICK;
                     }
-                } else if (scaledMidDiff > scaledBassDiff && scaledMidDiff > scaledTrebleDiff) {
-                    result.type = BeatType.SNARE;
-                } else {
-                    result.type = BeatType.HIHAT;
                 }
 
                 result.confidence = Math.min(1.0, spectralFlux / (adaptiveThreshold * 2));

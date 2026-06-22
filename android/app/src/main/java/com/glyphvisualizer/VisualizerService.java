@@ -34,7 +34,6 @@ public class VisualizerService extends Service {
     private static final double[] SENSITIVITY_PRESETS = {0.75, 1.0, 1.3, 1.7};
     private static final String[] SENSITIVITY_PRESET_LABELS = {"LOW", "STD", "HIGH", "MAX"};
 
-    private static final long GLYPH_UPDATE_INTERVAL_MS = 16;
     // UI telemetry posting rate. Post ~every DSP frame (capped ~120Hz) while the app is on-screen so
     // the dashboard tracks the 120Hz panel; drop to ~30Hz when backgrounded since nothing is watching.
     // Effective rate is min(this, DSP rate): ~48Hz on SYSTEM, up to ~90Hz on MIC. Flipped by the
@@ -62,6 +61,10 @@ public class VisualizerService extends Service {
     private volatile boolean isRunning = false;
 
     private volatile double sensitivity = 1.0;
+    // AI drum classifier toggle. When on (default), onsets are typed by the learned MLP
+    // (DrumClassifier); when off, the legacy band-energy-diff heuristic is used. Applied to the
+    // BeatDetector on init and whenever the setting changes.
+    private volatile boolean useMlClassifier = true;
     private volatile int currentModel = 4;
     private volatile String currentCaptureSource = SOURCE_IDLE;
     private volatile int visualizerSampleRate = 44100;
@@ -74,7 +77,6 @@ public class VisualizerService extends Service {
 
     private final android.os.Handler mainHandler = new android.os.Handler(Looper.getMainLooper());
     private android.os.PowerManager.WakeLock wakeLock;
-    private long lastGlyphUpdate = 0;
     private final java.util.Map<String, Object> flutterEventMap = new java.util.HashMap<>(32);
     private final java.util.List<Double> flutterMagList = new java.util.ArrayList<>(64);
     private long lastFlutterPostAt = 0;
@@ -95,15 +97,12 @@ public class VisualizerService extends Service {
     // Last-rendered on/off state (-1 = unknown), so we emit a frame only when it flips and stop
     // flooding the Nothing glyph service with identical frames while idle.
     private int lastDrumState = -1;
-    // Peak-follower over total spectral energy. Normalizes the per-band energies for the "BEAT"
-    // overdrive flashing so it adapts to loudness instead of a fixed scale.
-    private double runningMaxEnergy = 0.01;
-    // Minimum on-hold per zone. Once a band flashes, its zone stays lit at least this long so brief
-    // frame-to-frame energy dips can't strobe it on/off. Tuned per drum (kick longest, hat shortest).
-    private long bassLitUntil = 0, midLitUntil = 0, trebleLitUntil = 0;
-    private static final long HOLD_BASS_MS = 50;
-    private static final long HOLD_MID_MS = 42;
-    private static final long HOLD_TREBLE_MS = 35;
+    // Beat-locked flash renderer state. A detected + AI-classified drum hit lights exactly ONE zone
+    // for a short flash, then the glyph goes dark until the next hit (a new hit shifts the light
+    // immediately). This replaced the old raw-energy peak-follower at the user's explicit request.
+    private int litZone = -1;            // -1 none, 0 kick->slash, 1 snare->dot, 2 hat->ring
+    private long flashUntil = 0;         // elapsedRealtime() ms; the lit zone goes dark once now >= this
+    private static final long FLASH_DURATION_MS = 45; // how long one hit stays lit before going dark
 
 
     private GlyphManager.Callback glyphCallback;
@@ -169,6 +168,12 @@ public class VisualizerService extends Service {
             }
             if (intent.hasExtra("useInternalAudio")) {
                 useInternalAudio = intent.getBooleanExtra("useInternalAudio", false);
+            }
+            if (intent.hasExtra("useMlClassifier")) {
+                useMlClassifier = intent.getBooleanExtra("useMlClassifier", true);
+                if (beatDetector != null) {
+                    beatDetector.setUseMlClassifier(useMlClassifier);
+                }
             }
         }
 
@@ -337,6 +342,7 @@ public class VisualizerService extends Service {
         int fftSize = 1024;
         fft = new FFT(fftSize);
         beatDetector = new BeatDetector();
+        beatDetector.setUseMlClassifier(useMlClassifier);
         real = new float[fftSize];
         imag = new float[fftSize];
         magnitude = new float[fftSize / 2];
@@ -404,6 +410,7 @@ public class VisualizerService extends Service {
         pendingKickOnset = false;
         pendingSnareOnset = false;
         pendingHatOnset = false;
+        litZone = -1;
         lastDrumState = -1;
         frameAccumulatorFill = 0;
         boolean captureStarted = false;
@@ -446,6 +453,7 @@ public class VisualizerService extends Service {
         pendingKickOnset = false;
         pendingSnareOnset = false;
         pendingHatOnset = false;
+        litZone = -1;
         lastDrumState = -1;
         if (glyphController != null) {
             glyphController.turnOff();
@@ -494,6 +502,7 @@ public class VisualizerService extends Service {
         pendingKickOnset = false;
         pendingSnareOnset = false;
         pendingHatOnset = false;
+        litZone = -1;
         lastDrumState = -1;
     }
 
@@ -658,19 +667,21 @@ public class VisualizerService extends Service {
         long nowEpoch = System.currentTimeMillis();
         long now = nowEpoch;
 
+        // Drive the on-screen mirror (glyph_zones) from the SAME rate-gated, AI-classified onset that
+        // lights the rear glyph, so the dashboard can't show a different drum than the back of the
+        // phone. Map the classified beat type -> kick(1)/snare(2)/hat(3); SUB_BASS counts as kick.
         int uiStruck = 0;
         boolean isNewOnset = false;
-        if (beatResult.multiBandOnsets != null) {
-            if (beatResult.multiBandOnsets[0] || beatResult.multiBandOnsets[1]) {
+        if (beatResult.isOnset) {
+            BeatDetector.BeatType t = beatResult.type;
+            if (t == BeatDetector.BeatType.KICK || t == BeatDetector.BeatType.SUB_BASS) {
                 uiStruck = 1;
-                isNewOnset = true;
-            } else if (beatResult.multiBandOnsets[2]) {
+            } else if (t == BeatDetector.BeatType.SNARE) {
                 uiStruck = 2;
-                isNewOnset = true;
-            } else if (beatResult.multiBandOnsets[3] || beatResult.multiBandOnsets[4]) {
+            } else if (t == BeatDetector.BeatType.HIHAT) {
                 uiStruck = 3;
-                isNewOnset = true;
             }
+            isNewOnset = uiStruck != 0;
         }
 
         if (isNewOnset) {
@@ -691,10 +702,7 @@ public class VisualizerService extends Service {
         }
         lastDspFrameAt = now;
 
-        if (nowMonotonic - lastGlyphUpdate >= GLYPH_UPDATE_INTERVAL_MS) {
-            updateGlyphs(beatResult);
-            lastGlyphUpdate = nowMonotonic;
-        }
+        updateGlyphs(beatResult);
 
         // Throttle UI events to ~30fps (the dashboard redraws no faster); the glyph hardware
         // and DSP analysis run at their own rates. Build the snapshot only when we actually post.
@@ -733,6 +741,7 @@ public class VisualizerService extends Service {
         flutterEventMap.put("isOnset", result.isOnset);
         flutterEventMap.put("confidence", result.confidence);
         flutterEventMap.put("beatType", result.type.name());
+        flutterEventMap.put("mlConfidence", result.mlConfidence);
         flutterEventMap.put("strongestBandIndex", result.strongestBandIndex);
         flutterEventMap.put("spatialPan", result.spatialPan);
         flutterEventMap.put("captureSource", currentCaptureSource);
@@ -758,61 +767,44 @@ public class VisualizerService extends Service {
             return;
         }
 
-        // Peak-follower over total spectral energy (bass+mid+treble), used to normalize the
-        // per-band energies below so the flashing adapts to overall loudness.
-        double totalEnergy = result.bassEnergy + result.midEnergy + result.trebleEnergy;
-        if (totalEnergy > runningMaxEnergy) {
-            runningMaxEnergy = totalEnergy;
-        } else {
-            runningMaxEnergy *= 0.999;
+        // "BEAT" (beat-locked flash): driven by detected, AI-classified drum HITS, not by raw band
+        // energy. Each hit pops exactly one zone hard-on for FLASH_DURATION_MS, then the glyph goes
+        // dark until the next hit; a fresh hit shifts the light to its zone instantly, so the lit bar
+        // hops in rhythm. Mapping matches glyph_zones (the on-screen mirror) and flashBeat:
+        // kick -> slash (A), snare -> dot (B), hi-hat -> ring (C).
+        long now = android.os.SystemClock.elapsedRealtime();
+
+        // Which drum fired this frame, from the latched per-type onsets (set upstream from the
+        // rate-gated, classified onset). Normally at most one is pending; if two land in the same
+        // frame the louder band wins the tie. No raw energy lights a zone on its own anymore.
+        int onsetZone = -1;
+        if (pendingKickOnset || pendingSnareOnset || pendingHatOnset) {
+            double best = -1.0;
+            if (pendingKickOnset  && result.bassEnergy   > best) { best = result.bassEnergy;   onsetZone = 0; }
+            if (pendingSnareOnset && result.midEnergy    > best) { best = result.midEnergy;    onsetZone = 1; }
+            if (pendingHatOnset   && result.trebleEnergy > best) { best = result.trebleEnergy; onsetZone = 2; }
         }
-
-        // "BEAT" (overdrive): violent raw-energy tracking, no smooth decay. Each zone flashes when its
-        // normalized band energy clears a sensitivity-derived threshold, OR when the matching drum onset
-        // fired. Onsets are latched across skipped renders so fast strikes are never dropped, and multiple
-        // zones can be lit at once. Mapping (in flashBeat): bass->slash, mid->dot, treble->ring.
-        double normBass   = clamp01(result.bassEnergy   / Math.max(runningMaxEnergy * 0.4, 0.01));
-        double normMid    = clamp01(result.midEnergy    / Math.max(runningMaxEnergy * 0.3, 0.01));
-        double normTreble = clamp01(result.trebleEnergy / Math.max(runningMaxEnergy * 0.2, 0.01));
-
-        // Sensitivity 1.0 -> low threshold (flashes easily); 0.1 -> high threshold (hard to flash).
-        double triggerThreshold = 0.85 - (sensitivity * 0.5);
-
-        // Raw per-band trigger this frame: normalized energy over threshold, or a latched onset.
-        boolean trigBass   = normBass   > triggerThreshold || pendingKickOnset;
-        boolean trigMid    = normMid    > triggerThreshold || pendingSnareOnset;
-        boolean trigTreble = normTreble > triggerThreshold || pendingHatOnset;
-
         pendingKickOnset = false;
         pendingSnareOnset = false;
         pendingHatOnset = false;
 
-        // Minimum on-hold: a fresh trigger relights the zone for its hold window. While energy stays
-        // up the zone keeps re-triggering and holds steady; brief dips can't strobe it dark. This is
-        // what removes the fast flicker without touching detection.
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (trigBass)   bassLitUntil   = now + HOLD_BASS_MS;
-        if (trigMid)    midLitUntil    = now + HOLD_MID_MS;
-        if (trigTreble) trebleLitUntil = now + HOLD_TREBLE_MS;
+        if (onsetZone >= 0) {
+            // Fresh hit: shift the light to this zone and (re)start its flash window.
+            litZone = onsetZone;
+            flashUntil = now + FLASH_DURATION_MS;
+        } else if (litZone >= 0 && now >= flashUntil) {
+            // Flash elapsed with no new hit: go dark and wait for the next beat.
+            litZone = -1;
+        }
 
-        boolean flashBass   = now < bassLitUntil;
-        boolean flashMid    = now < midLitUntil;
-        boolean flashTreble = now < trebleLitUntil;
-
-        // Emit a frame only when the lit combination changes, so an idle glyph stops re-sending.
-        int state = (flashBass ? 1 : 0) | (flashMid ? 2 : 0) | (flashTreble ? 4 : 0);
+        // Emit a frame only when the lit zone changes, so a held flash / idle glyph stops re-sending.
+        int state = litZone + 1; // -1 dark -> 0; kick/snare/hat -> 1/2/3
         if (state == lastDrumState) {
             return;
         }
         lastDrumState = state;
 
-        glyphController.flashBeat(flashBass, flashMid, flashTreble);
-    }
-
-    private double clamp01(double value) {
-        if (value < 0) return 0;
-        if (value > 1) return 1;
-        return value;
+        glyphController.flashBeat(litZone == 0, litZone == 1, litZone == 2);
     }
 
     private double nextSensitivityPreset(double currentValue) {

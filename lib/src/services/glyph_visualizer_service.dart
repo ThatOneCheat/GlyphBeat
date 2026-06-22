@@ -31,12 +31,14 @@ class GlyphVisualizerService {
     required double sensitivity,
     required int model,
     required bool useInternalAudio,
+    required bool useMlClassifier,
   }) async {
     try {
       await _channel.invokeMethod('start', {
         'sensitivity': sensitivity,
         'model': model,
         'useInternalAudio': useInternalAudio,
+        'useMlClassifier': useMlClassifier,
       });
     } on MissingPluginException {
       return;
@@ -84,6 +86,17 @@ class GlyphVisualizerService {
   static Future<void> setModel(int model) async {
     try {
       await _channel.invokeMethod('setModel', {'model': model});
+    } on MissingPluginException {
+      return;
+    }
+  }
+
+  /// Toggle the AI drum classifier live while running (true = learned MLP types each
+  /// onset, false = legacy band-energy heuristic).
+  static Future<void> setMlClassifier(bool useMlClassifier) async {
+    try {
+      await _channel
+          .invokeMethod('setMlClassifier', {'useMlClassifier': useMlClassifier});
     } on MissingPluginException {
       return;
     }

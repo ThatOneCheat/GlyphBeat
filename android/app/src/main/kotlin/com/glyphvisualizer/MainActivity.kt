@@ -28,6 +28,7 @@ class MainActivity : FlutterFragmentActivity() {
     private var sensitivity = 1.0
     private var model = 4
     private var useInternalAudio = true
+    private var useMlClassifier = true
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -57,6 +58,7 @@ class MainActivity : FlutterFragmentActivity() {
                 sensitivity = call.argument<Double>("sensitivity") ?: 1.0
                 model = call.argument<Int>("model") ?: 4
                 useInternalAudio = call.argument<Boolean>("useInternalAudio") ?: true
+                useMlClassifier = call.argument<Boolean>("useMlClassifier") ?: true
                 startVisualizer()
                 result.success(true)
             }
@@ -94,6 +96,11 @@ class MainActivity : FlutterFragmentActivity() {
                 updateServiceSettings()
                 result.success(true)
             }
+            "setMlClassifier" -> {
+                useMlClassifier = call.argument<Boolean>("useMlClassifier") ?: true
+                updateServiceSettings()
+                result.success(true)
+            }
             "isRunning" -> {
                 result.success(VisualizerService.isServiceRunning)
             }
@@ -116,6 +123,7 @@ class MainActivity : FlutterFragmentActivity() {
         // SYSTEM audio is captured via the Visualizer (no MediaProjection / screen-record needed);
         // MIC mode uses the microphone. The user picks via the in-app toggle.
         intent.putExtra("useInternalAudio", useInternalAudio)
+        intent.putExtra("useMlClassifier", useMlClassifier)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -139,6 +147,7 @@ class MainActivity : FlutterFragmentActivity() {
             val intent = Intent(this, VisualizerService::class.java)
             intent.putExtra("sensitivity", sensitivity)
             intent.putExtra("model", model)
+            intent.putExtra("useMlClassifier", useMlClassifier)
             startService(intent)
         }
     }

@@ -31,6 +31,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _prefsKeyDiagnostics = 'show_diagnostics';
   static const _prefsKeySensitivity = 'sensitivity';
   static const _prefsKeyUseInternalAudio = 'use_internal_audio';
+  static const _prefsKeyUseMlClassifier = 'use_ml_classifier';
   // UI redraw throttle: smooth (~120Hz cap) while on-screen, calm (~30Hz) when backgrounded.
   // Kept in lockstep with the native event rate via setForeground() in didChangeAppLifecycleState.
   static const _uiRefreshFg = Duration(milliseconds: 8);
@@ -42,6 +43,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   double _sensitivity = 1.0;
   int _currentModel = 4;
   bool _useInternalAudio = true;
+  bool _useMlClassifier = true;
   String _captureSource = 'IDLE';
 
   final Set<int> _supportedModels = <int>{};
@@ -97,6 +99,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final resolvedSensitivity = prefs.getDouble(_prefsKeySensitivity) ?? 1.0;
     final showDiagnostics = prefs.getBool(_prefsKeyDiagnostics) ?? false;
     final useInternalAudio = prefs.getBool(_prefsKeyUseInternalAudio) ?? true;
+    final useMlClassifier = prefs.getBool(_prefsKeyUseMlClassifier) ?? true;
 
     _prefs = prefs;
 
@@ -111,6 +114,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _currentModel = resolvedModel;
       _sensitivity = resolvedSensitivity;
       _useInternalAudio = useInternalAudio;
+      _useMlClassifier = useMlClassifier;
     });
 
     await _persistSettings();
@@ -128,6 +132,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setBool(_prefsKeyDiagnostics, _showDiagnostics);
     await prefs.setDouble(_prefsKeySensitivity, _sensitivity);
     await prefs.setBool(_prefsKeyUseInternalAudio, _useInternalAudio);
+    await prefs.setBool(_prefsKeyUseMlClassifier, _useMlClassifier);
   }
 
   void _subscribeToEvents() {
@@ -188,6 +193,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       sensitivity: _sensitivity,
       model: _currentModel,
       useInternalAudio: _useInternalAudio,
+      useMlClassifier: _useMlClassifier,
     );
     final running = await GlyphVisualizerService.isRunning();
 
@@ -267,6 +273,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_isRunning) {
       // Swap the live source in-place (keeps the service/glyph session up).
       await GlyphVisualizerService.setCaptureMode(useInternal);
+    }
+  }
+
+  Future<void> _setMlClassifier(bool useMl) async {
+    if (useMl == _useMlClassifier) {
+      return;
+    }
+    setState(() {
+      _useMlClassifier = useMl;
+    });
+    await _persistSettings();
+    if (_isRunning) {
+      // Flip the classifier live (no capture/glyph restart needed).
+      await GlyphVisualizerService.setMlClassifier(useMl);
     }
   }
 
@@ -353,6 +373,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ],
                     const SizedBox(height: 32),
                     _buildCaptureModeSelector(),
+                    const SizedBox(height: 32),
+                    _buildClassifierSelector(),
                     const SizedBox(height: 32),
                     _buildModelSelector(),
                     const SizedBox(height: 32),
@@ -789,6 +811,90 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Expanded(
       child: GestureDetector(
         onTap: () => unawaited(_setCaptureMode(useInternal)),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color:
+                isSelected ? Colors.white : Colors.white.withValues(alpha: 0.04),
+            borderRadius: BorderRadius.circular(100),
+            border: Border.all(
+              color:
+                  isSelected ? Colors.white : Colors.white.withValues(alpha: 0.1),
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontFamily: 'Space Grotesk',
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: isSelected ? Colors.black : Colors.white,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildClassifierSelector() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text(
+              'DRUM DETECTION',
+              style: TextStyle(
+                fontFamily: 'JetBrains Mono',
+                fontSize: 10,
+                color: Colors.white54,
+                letterSpacing: 2,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const Spacer(),
+            // Live confidence readout from the AI classifier on the most recent onset.
+            if (_useMlClassifier)
+              ValueListenableBuilder<AudioFrameData?>(
+                valueListenable: _latestFrameNotifier,
+                builder: (context, frame, _) {
+                  final conf = frame?.mlConfidence ?? 0;
+                  if (conf <= 0) {
+                    return const SizedBox.shrink();
+                  }
+                  return Text(
+                    'AI ${(conf * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 10,
+                      color: Colors.white38,
+                      letterSpacing: 1,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  );
+                },
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            _buildClassifierPill('AI MODEL', true),
+            const SizedBox(width: 12),
+            _buildClassifierPill('HEURISTIC', false),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildClassifierPill(String label, bool useMl) {
+    final isSelected = _useMlClassifier == useMl;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => unawaited(_setMlClassifier(useMl)),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           padding: const EdgeInsets.symmetric(vertical: 14),

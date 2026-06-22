@@ -14,7 +14,7 @@ theres also a vocal notch in there (300 to 800 hz gets suppressed) so it biases 
 
 ## the BEAT mode (aka overdrive)
 
-theres one mode and its called BEAT, and the renderer behind it i call "overdrive" cuz thats the entire personality. raw energy. no smooth fade outs, no gentle decay, just HARD on and off at full brightness. violent. its supposed to feel like the lights are getting punched.
+theres one mode and its called BEAT. the personality is still pure overdrive, no smooth fade outs, no gentle decay, just HARD on and off at full brightness, violent, like the lights are getting punched. but now its beat LOCKED, it doesnt chase loudness anymore, it reacts to actual drum HITS.
 
 it splits the sound into 3 bands and each one owns a glyph zone:
 
@@ -22,9 +22,21 @@ it splits the sound into 3 bands and each one owns a glyph zone:
 - mid / snare goes to the dot
 - treble / hi hat goes to the ring
 
-and the key thing, multiple can be lit at the same time. kick and a hat land together? both slam on, full bright, no dimming, no "primary zone wins" nonsense. every frame it normalizes each band against a running peak follower of the total energy and lights the zone if it either beats a sensitivity threshold OR the actual drum onset fired for that band. and onsets get latched across frames so even if a hit lands between renders it doesnt get dropped.
+and the key thing, its exclusive, exactly ONE zone is lit at a time. every detected drum hit gets classified (kick / snare / hat) and flashes its zone, and the moment the next hit lands the light SHIFTS over to that zone. so the single bar just hops around the back of ur phone in time with the drums, kick→slash, snare→dot, hat→ring. if two hits somehow land in the same frame the louder one wins, and hits get latched across frames so a fast one that lands between renders doesnt get dropped.
 
-each zone also gets held on for a tiny minimum window (like 50ms for bass, 42 for mid, 35 for treble) so frame to frame energy dips cant strobe it. honestly that little hold timing is THE thing that makes it feel good instead of seizure-y flicker. and the renderer only actually pushes a new frame when the lit combo changes, so an idle glyph just... stops sending. efficient lil guy.
+each hit pops its zone for a short flash (~45ms) then it goes DARK until the next hit. so on a sparse beat you get a clean pop then black, and on a busy one the light just keeps hopping zone to zone. it reacts every single dsp frame with basically zero latency, but only actually pushes a new frame to the glyph when the lit zone changes, so an idle glyph just... stops sending. efficient lil guy.
+
+## the AI part (yes theres an actual neural net now)
+
+ok so heres the new toy. figuring out WHEN a drum hits was always solid (thats the spectral flux onset detection, its good, i left it alone). the weak bit was figuring out WHAT it was, kick vs snare vs hat, that used to be a dumb "compare some band energies and guess" heuristic. now theres a tiny neural net that does it instead. it looks at the *shape* of the spectrum the instant a hit lands and goes "thats a kick" / "thats a snare" / "thats a hat", which is basically what ur ear does.
+
+its a real trained model (a `29→96→48→3` MLP, two hidden layers) but its tiny and runs in pure java in like **~7 microseconds per hit** (measured, and theres a test that fails if it ever regresses), **fully on the phone, no internet, no tensorflow, no downloading some 200mb model**. and it only runs the instant a hit lands, not every frame, so it adds basically zero latency to the lights. fits the whole offline-screen-off vibe of the app perfectly. theres a toggle in the app, **AI MODEL** vs **HEURISTIC**, flip it live and feel the difference, and when AI mode is on it shows u the model's confidence on the last hit.
+
+it reads 29 numbers off the onset frame, 24 loudness-normalized log-frequency bands plus 5 spectral descriptors (centroid, spread, 85% rolloff, flatness, low/high ratio), basically a fingerprint of the spectrum shape, and the net says kick/snare/hat from that.
+
+how it got trained: it learns from **real drum recordings**. the [IDMT-SMT-Drums](https://zenodo.org/records/7544164) dataset is 95 real drum loops (44.1khz, same as the engine) where every kick/snare/hat onset is hand-annotated, AND it ships isolated per-instrument stems. so `tool/prepare_real_dataset.py` windows the *isolated* stem at each annotated onset to get perfectly clean, unambiguously labeled examples (plus realistic in-mix windows), snapping each window to the actual transient peak and gating out silent/bleed junk. then `tool/train_real.py` trains the net on a **GPU via pytorch** (trained this on an rtx 3060), grounded with a dose of the old synthetic augmentation mixed into the train set so it stays robust to phone-mic nasties the clean studio dataset doesnt have. it exports the exact same java weight file + golden parity tests, so nothing about the on-phone side changes.
+
+> real talk on accuracy: **~97% on a held-out test set of drum loops the model has never seen** (the split is by whole loop, so no augmented copy of a hit ever leaks from train into test, this is the honest generalization number). and the thing it used to suck at, telling a snare from a hi-hat, is basically fixed now (snare F1 ~0.97), because real snares and real hats actually look different in a way my synthetic ones didnt fully capture. theres still a pure-synthetic trainer (`tool/train_drum_classifier.py`) if u dont want to grab the dataset, but the real-data one is the good one.
 
 > the timing and threshold numbers in here are tuned by pure feel over way too many hours. theyre kinda sacred. if u start nudging thresholds randomly it stops feeling good real fast, u been warned.
 
@@ -91,7 +103,7 @@ they talk over two channels:
 also a cute detail, theres THREE different clock rates in here on purpose and theyre all independent:
 
 - dsp analysis runs ~172 frames/sec on mic (256 sample hop, 75% overlap) or ~48 hz on the visualizer poll
-- the glyph render is throttled to ~60 hz
+- the glyph render runs on every dsp frame now (no throttle) so the lights are as instant as the analysis, but it only actually pushes to the hardware when the lit zone changes
 - the flutter events are adaptive, ~120 hz cap while the ui is on screen so the dashboard keeps up, dropping to ~30 hz when u background the app so it stops wasting battery drawing a dashboard nobody is looking at
 
 ### the native files (where the magic is)
@@ -102,6 +114,7 @@ also a cute detail, theres THREE different clock rates in here on purpose and th
 - **`AudioCapture.java`** is the mic path. it negotiates, tries a couple sample rates and a few audio sources preferring the unprocessed signal, reports what it actually got, and surfaces hard read failures so the service can recover instead of just dying.
 - **`SystemVisualizerCapture.java`** is the system audio path, the global visualizer on session 0, the one that beats spotifys capture block. polls `getWaveForm()` on its own thread instead of using the rate limited callback so it gets ~48 hz instead of the ~20 hz callback cap.
 - **`GlyphController.java`** is the hardware layer over the nothing `ketchum` sdk. maps logical channels A/B/C to the physical led indices per device model, and does the gamma corrected brightness (gamma 2.2, maxes at 4000 of the sdks 0 to 4095). `flashBeat` is the multi zone overdrive lighting call.
+- **`DrumClassifier.java`** is the AI bit, the tiny MLP that types each onset as kick/snare/hat from the spectral shape. `DrumClassifierModel.java` next to it is the generated weights (dont hand edit it, its made by the trainer). zero-alloc forward pass, pure java. trained on real drums by `tool/train_real.py` (`tool/prepare_real_dataset.py` preps the data, `tool/train_drum_classifier.py` is the synthetic-only fallback + shared feature code), parity locked by `DrumClassifierTest.java`.
 - **`MainActivity.kt`** is the flutter entry point on the android side, wires up the method and event channels and holds the global event sink that bridges the activity and the service.
 
 ### the flutter files (the pretty part)
@@ -121,7 +134,7 @@ also a cute detail, theres THREE different clock rates in here on purpose and th
 - the `NothingKey` in the manifest is set to `"test"`, thats the dev placeholder key, fine for messing around but its not a prod key
 - only the 3a pro is properly tested, other models have led mappings but i genuinely cant promise theyre right
 - the dsp and timing constants are precious, tuned by feel, please dont drive by "improve" them
-- theres an older single zone `animateDrums` renderer still sitting in `GlyphController` from a previous build, its not wired up anymore, ignore it, the multi zone overdrive thing replaced it
+- theres an older `animateDrums` renderer still sitting in `GlyphController` from a previous build, its not wired up anymore, ignore it, the current beat-locked `flashBeat` renderer replaced it
 
 thats basically the whole thing. a music visualizer for the BACK of ur phone that actually listens instead of just blinking at volume. vibe coded on and off but the math under it is very real fr.
 
